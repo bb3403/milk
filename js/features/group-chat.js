@@ -90,6 +90,12 @@ window.loadGroupChatSettingsForCurrentSession = function() {
     groupChatSettings.showName = session.groupSettings.showName;
     // enabled 是派生状态：有成员就是群聊
     groupChatSettings.enabled = groupChatSettings.members.length > 0;
+
+    // 修复"切换会话时群聊先显示成私聊再恢复"的闪烁:
+    // 载入完成后立刻重新渲染消息, 让历史消息能正确套上成员身份/头像
+    if (typeof renderMessages === 'function') {
+        try { renderMessages(true); } catch(e) { /* 静默, 不打断启动 */ }
+    }
 };
 
 // 把运行时 groupChatSettings 写回当前 session 并持久化 sessionList
@@ -123,6 +129,12 @@ function saveGroupChatSettings() {
     });
     // enabled 同步刷新
     groupChatSettings.enabled = (groupChatSettings.members || []).length > 0;
+
+    // 改完成员后, 主聊天界面也要重渲染——
+    // 这样删人/加人/改头像/改名能立刻反映到历史消息的显示上
+    if (typeof renderMessages === 'function') {
+        try { renderMessages(true); } catch(e) { /* 静默 */ }
+    }
 }
 
 // 从 localforage 异步载入成员头像 (大文件, 不放在 sessionList 里)
@@ -353,13 +365,47 @@ window.deleteGroupMember = function(idx) {
     }
 };
 
-// 收到的消息用哪个成员的身份展示 (随机, 由 msg.id 派生 → 同一条消息总是同一个成员说的)
+// 收到的消息用哪个成员的身份展示
+//
+// 修复版（针对原版"成员数量变化后所有历史消息洗牌"的bug）：
+// 1. 第一次给某条消息分配成员身份时，把成员id写进消息本身（msg.groupSpeakerId）
+//    并触发持久化保存。
+// 2. 之后渲染同一条消息时，直接读 msg.groupSpeakerId 找成员——不再依赖 hash%length，
+//    所以加人/删人都不会影响其他消息的归属。
+// 3. 如果 msg.groupSpeakerId 指向的成员已经被删除，返回 null（消息回退到默认"对方"显示），
+//    其他成员的消息不受影响。
+// 4. 成员被改名或换头像不影响——因为我们存的是 id，渲染时读最新的 name/avatar。
 window.getGroupMemberForMessage = function(msgId) {
     if (!groupChatSettings.enabled || !groupChatSettings.members || groupChatSettings.members.length === 0) return null;
+    var members = groupChatSettings.members;
+
+    // 从全局 messages 数组找这条消息
+    var msg = (typeof messages !== 'undefined' && messages)
+        ? messages.find(function(m) { return String(m.id) === String(msgId); })
+        : null;
+
+    // 如果消息已有 groupSpeakerId, 用它查
+    if (msg && msg.groupSpeakerId) {
+        var found = members.find(function(m) { return m.id === msg.groupSpeakerId; });
+        if (found) return found;
+        // 指向的成员被删了 — 返回 null, 让 UI 回退到默认"对方"
+        return null;
+    }
+
+    // 没有 groupSpeakerId — 第一次分配, 用确定性 hash
     var seed = 0;
     var idStr = String(msgId);
     for (var i = 0; i < idStr.length; i++) seed += idStr.charCodeAt(i) * (i + 1);
-    return groupChatSettings.members[seed % groupChatSettings.members.length];
+    var pick = members[seed % members.length];
+
+    // 写回 msg 并触发持久化（防止下次重渲染时 members.length 变了导致洗牌）
+    if (msg && pick && pick.id) {
+        msg.groupSpeakerId = pick.id;
+        if (typeof throttledSaveData === 'function') {
+            try { throttledSaveData(); } catch(e) { /* 静默 */ }
+        }
+    }
+    return pick;
 };
 
 // =========================================================================
