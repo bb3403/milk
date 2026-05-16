@@ -1,3 +1,22 @@
+/**
+ * group-chat.js — per-session edition
+ *
+ * 改动摘要（by 闻香 for 咪）：
+ * 1. 群聊设置不再是全局 localStorage，而是每个 session 独立。
+ * 2. "是否群聊"不再有显式开关，由 members.length 自动决定：
+ *      members.length > 0  →  群聊
+ *      members.length == 0 →  私聊
+ *    加人就是开群，删完人就是回到私聊。
+ * 3. 切换 session 时，自动从该 session 的 groupSettings 重新载入运行时状态。
+ * 4. 现有 sessionList 中没有 groupSettings 字段的旧 session，自动按"私聊"处理（向前兼容）。
+ *
+ * 关键 invariant: groupChatSettings 永远是"当前 session 的 groupSettings 的运行时镜像"。
+ * 所有改动通过 saveGroupChatSettings() 写回 session 并持久化 sessionList。
+ */
+
+// =========================================================================
+// 原有的 search/stats tab 切换逻辑 —— 不动
+// =========================================================================
 window.switchStatsTab = function(tab) {
     var statsPanel = document.getElementById('stats-panel');
     var favoritesPanel = document.getElementById('favorites-panel');
@@ -32,61 +51,110 @@ window.switchStatsTab = function(tab) {
     }
 };
 
-var groupChatSettings = (function() {
-    try {
-        var saved = JSON.parse(localStorage.getItem('groupChatSettings') || 'null');
-        if (!saved) return { enabled: false, showAvatar: true, showName: true, members: [] };
-        if (!saved.members) saved.members = [];
-        return saved;
-    } catch(e) { return { enabled: false, showAvatar: true, showName: true, members: [] }; }
-})();
-(function loadGroupAvatars() {
-    if (!window.localforage) return;
+// =========================================================================
+// 群聊设置 —— 全部 per-session
+// =========================================================================
+
+// 运行时状态：始终是"当前session的groupSettings镜像"
+var groupChatSettings = { enabled: false, showAvatar: true, showName: true, members: [] };
+var _groupMemberAvatarDataUrl = null;
+
+// 辅助：拿到当前 session 对象
+function _getCurrentSession() {
+    if (typeof sessionList === 'undefined' || !sessionList || !SESSION_ID) return null;
+    return sessionList.find(function(s) { return s.id === SESSION_ID; }) || null;
+}
+
+// 辅助：保证 session 有 groupSettings 子字段 (向前兼容旧 session)
+function _ensureSessionGroupFields(session) {
+    if (!session) return;
+    if (typeof session.members === 'undefined') session.members = [];
+    if (typeof session.groupSettings === 'undefined') {
+        session.groupSettings = { showAvatar: true, showName: true };
+    } else {
+        if (typeof session.groupSettings.showAvatar === 'undefined') session.groupSettings.showAvatar = true;
+        if (typeof session.groupSettings.showName === 'undefined') session.groupSettings.showName = true;
+    }
+}
+
+// 从当前 session 把数据拉到运行时 groupChatSettings
+window.loadGroupChatSettingsForCurrentSession = function() {
+    var session = _getCurrentSession();
+    if (!session) {
+        groupChatSettings = { enabled: false, showAvatar: true, showName: true, members: [] };
+        return;
+    }
+    _ensureSessionGroupFields(session);
+    groupChatSettings.members = session.members.slice(); // 浅拷贝，避免运行时操作直接污染 session
+    groupChatSettings.showAvatar = session.groupSettings.showAvatar;
+    groupChatSettings.showName = session.groupSettings.showName;
+    // enabled 是派生状态：有成员就是群聊
+    groupChatSettings.enabled = groupChatSettings.members.length > 0;
+};
+
+// 把运行时 groupChatSettings 写回当前 session 并持久化 sessionList
+function saveGroupChatSettings() {
+    var session = _getCurrentSession();
+    if (!session) return;
+    _ensureSessionGroupFields(session);
+
+    // 写回 session
+    session.members = (groupChatSettings.members || []).map(function(m) {
+        if (!m.id) m.id = 'gcm_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+        return { name: m.name, id: m.id, avatarRef: m.avatarRef || ('gca_' + m.id) };
+    });
+    session.groupSettings = {
+        showAvatar: groupChatSettings.showAvatar,
+        showName: groupChatSettings.showName
+    };
+    // 持久化整个 sessionList
+    if (window.localforage && window.APP_PREFIX) {
+        localforage.setItem(APP_PREFIX + 'sessionList', sessionList).catch(function(e) {
+            console.warn('sessionList 保存失败:', e);
+        });
+    }
+    // 头像 (大文件) 单独存
+    (groupChatSettings.members || []).forEach(function(m) {
+        if (m.avatar && window.localforage) {
+            localforage.setItem('gca_' + m.id, m.avatar).catch(function(e) {
+                console.warn('成员头像保存失败 id=' + m.id, e);
+            });
+        }
+    });
+    // enabled 同步刷新
+    groupChatSettings.enabled = (groupChatSettings.members || []).length > 0;
+}
+
+// 从 localforage 异步载入成员头像 (大文件, 不放在 sessionList 里)
+window.loadGroupAvatarsForCurrentSession = function() {
+    if (!window.localforage) return Promise.resolve();
     var members = groupChatSettings.members || [];
-    if (members.length === 0) return;
+    if (members.length === 0) return Promise.resolve();
     var promises = members.map(function(m, i) {
         var ref = m.avatarRef || (m.id ? 'gca_' + m.id : 'gca_' + i);
         return localforage.getItem(ref).then(function(avatar) {
             m.avatar = avatar || null;
         }).catch(function() { m.avatar = null; });
     });
-    Promise.all(promises).then(function() {
+    return Promise.all(promises).then(function() {
         if (typeof renderGroupMembersList === 'function') renderGroupMembersList();
     });
-})();
-var _groupMemberAvatarDataUrl = null;
+};
 
-function saveGroupChatSettings() {
-    var members = groupChatSettings.members || [];
-    var toSave = {
-        enabled: groupChatSettings.enabled,
-        showAvatar: groupChatSettings.showAvatar,
-        showName: groupChatSettings.showName,
-        members: members.map(function(m) {
-            if (!m.id) m.id = 'gcm_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
-            return { name: m.name, id: m.id, avatarRef: 'gca_' + m.id };
-        })
-    };
+// 启动时清理掉旧版本的 global localStorage 项 (一次性, 防止干扰)
+(function cleanupLegacyGlobalGroupChatSettings() {
     try {
-        localStorage.setItem('groupChatSettings', JSON.stringify(toSave));
-    } catch(e) {
-        console.warn('groupChatSettings localStorage保存失败:', e);
-    }
-    if (window.localforage) {
-        members.forEach(function(m) {
-            if (!m.id) m.id = 'gcm_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
-            localforage.setItem('gca_' + m.id, m.avatar || null).catch(function(e) {
-                console.warn('头像存储失败 id=' + m.id, e);
-            });
-        });
-    }
-}
+        if (localStorage.getItem('groupChatSettings')) {
+            localStorage.removeItem('groupChatSettings');
+        }
+    } catch(e) { /* 静默 */ }
+})();
 
 function renderGroupMembersList() {
     var list = document.getElementById('group-members-list');
     if (!list) return;
     if (!groupChatSettings.members || groupChatSettings.members.length === 0) {
-        list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-secondary);font-size:13px;">暂无成员，点击添加按钮添加</div>';
+        list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-secondary);font-size:13px;">本会话目前是<strong style="color:var(--accent-color);">私聊</strong> — 点击上方"添加"按钮加入第一个成员，本会话即转为群聊。</div>';
         return;
     }
     list.innerHTML = groupChatSettings.members.map(function(m, i) {
@@ -108,20 +176,27 @@ function updateGroupModeUI() {
     var status = document.getElementById('group-mode-status');
     var displaySection = document.getElementById('group-display-section');
     var membersSection = document.getElementById('group-members-section');
-    if (!pill) return;
-    if (groupChatSettings.enabled) {
-        pill.style.background = 'var(--accent-color)';
-        knob.style.left = '22px';
-        status.textContent = '已开启 — 收到的消息随机显示成员';
-        displaySection.style.display = 'block';
-        membersSection.style.display = 'block';
+    var modeIcon = document.getElementById('group-mode-icon');
+    if (!status) return;
+
+    // 模式状态显示 (派生)
+    var isGroup = groupChatSettings.members && groupChatSettings.members.length > 0;
+    if (isGroup) {
+        if (pill) pill.style.background = 'var(--accent-color)';
+        if (knob) knob.style.left = '22px';
+        status.textContent = '本会话：群聊（' + groupChatSettings.members.length + '人）';
+        if (modeIcon) modeIcon.className = 'fas fa-users';
     } else {
-        pill.style.background = 'var(--border-color)';
-        knob.style.left = '3px';
-        status.textContent = '已关闭 — 点击开启';
-        displaySection.style.display = 'none';
-        membersSection.style.display = 'none';
+        if (pill) pill.style.background = 'var(--border-color)';
+        if (knob) knob.style.left = '3px';
+        status.textContent = '本会话：私聊（添加成员即转为群聊）';
+        if (modeIcon) modeIcon.className = 'fas fa-user';
     }
+
+    // 显示选项/成员区永远显示 (不再依赖 enabled)
+    if (displaySection) displaySection.style.display = 'block';
+    if (membersSection) membersSection.style.display = 'block';
+
     var avatarPill = document.getElementById('group-show-avatar-pill');
     var avatarKnob = document.getElementById('group-show-avatar-knob');
     if (avatarPill) {
@@ -138,12 +213,14 @@ function updateGroupModeUI() {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+    // 注：旧的 group-mode-toggle (大开关) 现在被解释为"打开成员管理"——点了也没用，
+    // 但保留监听以免有用户惯性，点击时给个 toast 解释。
     var groupModeToggle = document.getElementById('group-mode-toggle');
     if (groupModeToggle) {
         groupModeToggle.addEventListener('click', function() {
-            groupChatSettings.enabled = !groupChatSettings.enabled;
-            saveGroupChatSettings();
-            updateGroupModeUI();
+            if (typeof showNotification === 'function') {
+                showNotification('群聊/私聊由成员数量自动判定，无需手动开关', 'info');
+            }
         });
     }
     var showAvatarToggle = document.getElementById('group-show-avatar-toggle');
@@ -169,7 +246,24 @@ document.addEventListener('DOMContentLoaded', function() {
             if (m && typeof hideModal === 'function') hideModal(m);
         });
     }
-    setTimeout(updateGroupModeUI, 200);
+
+    // 启动时把当前session的群聊设置载入运行时。
+    // sessionList 由 initializeSession() 异步加载, 需要等它好.
+    // 用轮询确保即使启动慢也能正确载入.
+    (function tryLoadWhenReady(retries) {
+        if (typeof sessionList !== 'undefined' && sessionList && SESSION_ID) {
+            window.loadGroupChatSettingsForCurrentSession();
+            if (typeof window.loadGroupAvatarsForCurrentSession === 'function') {
+                window.loadGroupAvatarsForCurrentSession();
+            }
+            updateGroupModeUI();
+        } else if (retries > 0) {
+            setTimeout(function() { tryLoadWhenReady(retries - 1); }, 200);
+        } else {
+            // 极端情况下 fallback: 让UI显示一个空状态, 不要卡死
+            updateGroupModeUI();
+        }
+    })(30); // 最多重试 30 次 = 6 秒, 足够任何冷启动
 });
 
 window.openAddGroupMember = function() {
@@ -221,25 +315,45 @@ window.saveGroupMember = function() {
     var name = (document.getElementById('group-member-name-input').value || '').trim();
     if (!name) { alert('请输入成员名字'); return; }
     var idxVal = document.getElementById('group-member-edit-index').value;
+    var wasEmpty = (groupChatSettings.members || []).length === 0;
+
     var member = { name: name, avatar: _groupMemberAvatarDataUrl };
     if (idxVal !== '') {
+        // 编辑现有：保留id以便复用avatar存储
+        var existing = groupChatSettings.members[parseInt(idxVal)];
+        if (existing && existing.id) member.id = existing.id;
         groupChatSettings.members[parseInt(idxVal)] = member;
     } else {
         if (!groupChatSettings.members) groupChatSettings.members = [];
+        member.id = 'gcm_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
         groupChatSettings.members.push(member);
     }
     saveGroupChatSettings();
     renderGroupMembersList();
+    updateGroupModeUI();
     window.closeGroupMemberEdit();
+
+    // 如果是从0个成员变成有成员: 提示"已转为群聊"
+    if (wasEmpty && idxVal === '') {
+        if (typeof showNotification === 'function') {
+            showNotification('本会话已转为群聊', 'success');
+        }
+    }
 };
 
 window.deleteGroupMember = function(idx) {
     if (!confirm('确定删除该成员吗？')) return;
+    var wasLastOne = groupChatSettings.members.length === 1;
     groupChatSettings.members.splice(idx, 1);
     saveGroupChatSettings();
     renderGroupMembersList();
+    updateGroupModeUI();
+    if (wasLastOne && typeof showNotification === 'function') {
+        showNotification('成员已清空，本会话已回到私聊模式', 'info');
+    }
 };
 
+// 收到的消息用哪个成员的身份展示 (随机, 由 msg.id 派生 → 同一条消息总是同一个成员说的)
 window.getGroupMemberForMessage = function(msgId) {
     if (!groupChatSettings.enabled || !groupChatSettings.members || groupChatSettings.members.length === 0) return null;
     var seed = 0;
@@ -248,6 +362,9 @@ window.getGroupMemberForMessage = function(msgId) {
     return groupChatSettings.members[seed % groupChatSettings.members.length];
 };
 
+// =========================================================================
+// 导出/导入设置 —— 原有逻辑保留
+// =========================================================================
 document.addEventListener('DOMContentLoaded', function() {
     var exportAllBtn = document.getElementById('export-all-settings');
     var importAllBtn = document.getElementById('import-all-settings');
@@ -256,6 +373,8 @@ if (exportAllBtn) {
             const overlay = document.createElement('div');
             overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.55);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;animation:fadeIn 0.2s ease;';
             overlay.innerHTML = `
+                <div style="background:var(--secondary-bg);border-radius:20px;padding:24px;width:88%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,0.4);animation:modalContentSlideIn 0.3s ease forwards;">
+                    <div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:4px;display:flex;align-items:center;gap:8px;">
                 <div style="background:var(--secondary-bg);border-radius:20px;padding:24px;width:88%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,0.4);animation:modalContentSlideIn 0.3s ease forwards;">
                     <div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:4px;display:flex;align-items:center;gap:8px;">
                         <i class="fas fa-archive" style="color:var(--accent-color);font-size:14px;"></i>全量备份导出
