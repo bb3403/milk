@@ -22,6 +22,28 @@
     'use strict';
 
     // ====================================================================
+    // 关键防御: 在 loadData() 跑之前清掉跨session的"紧急备份"
+    //
+    // milk的紧急备份机制不绑 sessionId. 如果当前要进的session没有自己的messages
+    // (例如新建session刚被点开), loadData会用_tryRecoverFromBackup()把别的session
+    // 的消息"恢复"过来. 这一段在脚本最开头跑, 确保loadData拿到的backup要么是
+    // 当前session的、要么是没有.
+    // ====================================================================
+    try {
+        var preBootHash = window.location.hash.substring(1);
+        if (preBootHash) {
+            var preBootBackup = localStorage.getItem('BACKUP_V1_critical');
+            if (preBootBackup) {
+                var preBootObj = JSON.parse(preBootBackup);
+                if (preBootObj && preBootObj.sessionId && preBootObj.sessionId !== preBootHash) {
+                    localStorage.removeItem('BACKUP_V1_critical');
+                    localStorage.removeItem('BACKUP_V1_timestamp');
+                }
+            }
+        }
+    } catch(e) { /* 静默 */ }
+
+    // ====================================================================
     // 0. 数据层
     // ====================================================================
 
@@ -174,6 +196,18 @@
             sessionList.push(newSession);
             if (window.localforage) {
                 await localforage.setItem(_key('sessionList'), sessionList);
+                // 保险层: 验证写入真的完成(防止race condition导致reload后读不到)
+                for (var attempt = 0; attempt < 8; attempt++) {
+                    try {
+                        var verify = await localforage.getItem(_key('sessionList'));
+                        if (verify && Array.isArray(verify) && verify.some(function(s) { return s.id === newId; })) {
+                            break; // 写入确认完成
+                        }
+                    } catch (e) { /* 静默 */ }
+                    await new Promise(function(r) { setTimeout(r, 80); });
+                }
+                // 同时把"目标session id"写到sessionStorage作为最终fallback
+                try { sessionStorage.setItem('milk_target_session', newId); } catch(e){}
             }
         }
         return newSession;
@@ -181,8 +215,28 @@
 
     // 进入某个 session (改hash + reload, 沿用原版机制)
     function enterSession(sessionId) {
+        // === 关键修复 ===
+        // milk有一个"紧急备份"机制 (localStorage里的BACKUP_V1_critical),
+        // 但这个备份不绑 sessionId. 如果新session的messages为空 (新建session),
+        // loadData会触发 _tryRecoverFromBackup() 把旧session的备份消息"恢复"到新session里.
+        //
+        // 解决方案: 进入session前, 如果备份是别的session的, 清掉它.
+        try {
+            var backupRaw = localStorage.getItem('BACKUP_V1_critical');
+            if (backupRaw) {
+                var backup = JSON.parse(backupRaw);
+                if (backup && backup.sessionId && backup.sessionId !== sessionId) {
+                    localStorage.removeItem('BACKUP_V1_critical');
+                    localStorage.removeItem('BACKUP_V1_timestamp');
+                }
+            }
+        } catch(e) { /* 静默 */ }
+
+        // 同时设_skipBackup=true, 防止pagehide/beforeunload期间再生成一个
+        // 老session的备份污染新session
+        window._skipBackup = true;
+
         window.location.hash = sessionId;
-        // 给 view mode 一个信号: 用户主动选择了进入聊天
         try { sessionStorage.setItem('milk_view_mode', 'chat'); } catch(e){}
         window.location.reload();
     }
@@ -748,15 +802,49 @@
 
         // 决定初始view mode
         var urlHash = window.location.hash.substring(1);
-        var lastMode = null;
-        try { lastMode = sessionStorage.getItem('milk_view_mode'); } catch(e){}
+        var targetSession = null;
+        try { targetSession = sessionStorage.getItem('milk_target_session'); } catch(e){}
 
-        // 如果URL有有效hash → 进聊天; 否则 → 进overview
+        // 如果URL有hash或者sessionStorage有目标session, 都尝试进入聊天
+        var wantedSessionId = urlHash || targetSession;
         var goChat = false;
-        if (urlHash && typeof sessionList !== 'undefined' && sessionList) {
-            if (sessionList.some(function(s) { return s.id === urlHash; })) {
+
+        if (wantedSessionId && typeof sessionList !== 'undefined' && sessionList) {
+            // 先看内存里的 sessionList
+            if (sessionList.some(function(s) { return s.id === wantedSessionId; })) {
                 goChat = true;
+            } else if (window.localforage) {
+                // 内存里没有 → 可能 race condition, 从 localforage 重新读
+                try {
+                    var fresh = await localforage.getItem(_key('sessionList'));
+                    if (fresh && Array.isArray(fresh) && fresh.some(function(s) { return s.id === wantedSessionId; })) {
+                        // 找到了 → 更新全局 sessionList
+                        sessionList.length = 0;
+                        fresh.forEach(function(s) { sessionList.push(s); });
+                        goChat = true;
+                        // 强制设置 SESSION_ID 并触发数据重新载入
+                        if (typeof SESSION_ID !== 'undefined') {
+                            window.SESSION_ID = wantedSessionId;
+                        }
+                        // hash也校正一下
+                        if (window.location.hash !== '#' + wantedSessionId) {
+                            window.location.hash = wantedSessionId;
+                        }
+                        // 重新载入数据 (因为core.js当初载入的是错的session)
+                        if (typeof loadData === 'function') {
+                            try { await loadData(); } catch(e) {}
+                        }
+                        if (typeof renderMessages === 'function') {
+                            try { renderMessages(); } catch(e) {}
+                        }
+                    }
+                } catch (e) { /* 静默 */ }
             }
+        }
+
+        // 进入聊天后清掉 target_session 标记 (一次性使用)
+        if (goChat) {
+            try { sessionStorage.removeItem('milk_target_session'); } catch(e){}
         }
 
         if (goChat) {
@@ -769,9 +857,11 @@
         }
     }
 
-    // 等 initializeSession + loadContacts 都完成后再 boot
+    // 等 initializeSession 真正完成后再 boot
+    // 判断条件: SESSION_ID 被设置了 (initializeSession 完成的标志)
     function tryBoot(retries) {
-        if (typeof sessionList !== 'undefined' && (sessionList === null || Array.isArray(sessionList))) {
+        if (typeof SESSION_ID !== 'undefined' && SESSION_ID !== null &&
+            typeof sessionList !== 'undefined' && Array.isArray(sessionList)) {
             boot();
         } else if (retries > 0) {
             setTimeout(function() { tryBoot(retries - 1); }, 200);
@@ -781,7 +871,7 @@
         }
     }
     document.addEventListener('DOMContentLoaded', function() {
-        tryBoot(40);
+        tryBoot(60); // 12秒等待窗口
     });
 
     // ====================================================================
